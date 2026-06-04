@@ -132,6 +132,13 @@ func (m model) Init() tea.Cmd {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if keyMsg, ok := msg.(tea.KeyMsg); ok {
+		switch keyMsg.String() {
+		case "ctrl+c", "ctrl+x":
+			return m, tea.Quit
+		}
+	}
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -201,14 +208,10 @@ GlobalKeys:
 		switch msg.String() {
 		case "tab":
 			m.activeTab = (m.activeTab + 1) % tabCount
-			if m.activeTab == tabRegexVault || m.activeTab == tabGitAnalytics {
-				m.isTyping = true
-			}
+			m.syncTabFocus()
 		case "shift+tab":
 			m.activeTab = (m.activeTab - 1 + tabCount) % tabCount
-			if m.activeTab == tabRegexVault || m.activeTab == tabGitAnalytics {
-				m.isTyping = true
-			}
+			m.syncTabFocus()
 		case "ctrl+c", "q":
 			if !m.isTyping {
 				return m, tea.Quit
@@ -217,6 +220,23 @@ GlobalKeys:
 	}
 
 	return m, nil
+}
+
+func (m *model) syncTabFocus() {
+	switch m.activeTab {
+	case tabRegexVault:
+		m.regex.updateFocus()
+		m.git.pathInput.Blur()
+		m.isTyping = true
+	case tabGitAnalytics:
+		for i := range m.regex.inputs {
+			m.regex.inputs[i].Blur()
+		}
+		m.git.pathInput.Focus()
+		m.isTyping = true
+	default:
+		m.isTyping = false
+	}
 }
 
 func (m model) View() string {
@@ -243,9 +263,9 @@ func (m model) View() string {
 		body = "Unknown tab."
 	}
 
-	help := "\n\nTab: next tab | Shift+Tab: previous tab | q/ctrl+c: quit"
+	help := "\n\nTab: next tab | Shift+Tab: previous tab | Ctrl+X/Ctrl+C: quit"
 	if m.activeTab == tabRegexVault {
-		help = "\n\nRegex Vault Controls: up/down or k/j switch input focus"
+		help = "\n\nRegex Vault Controls: up/down switch input focus"
 	} else if m.activeTab == tabGitAnalytics {
 		help = "\n\nGit Analytics Controls: Enter starts scan | Tab switches tabs"
 	}
@@ -258,11 +278,11 @@ func (r regexVaultModel) Update(msg tea.Msg) (regexVaultModel, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "up", "k":
+		case "up":
 			r.focusIndex = (r.focusIndex - 1 + len(r.inputs)) % len(r.inputs)
 			r.updateFocus()
 			return r, nil
-		case "down", "j":
+		case "down":
 			r.focusIndex = (r.focusIndex + 1) % len(r.inputs)
 			r.updateFocus()
 			return r, nil

@@ -1,0 +1,8 @@
+# Local editor settings
+.vscode/
+
+# Built binaries
+/dev-toolkit
+
+# Local toolchain archives
+*.tar.gz
