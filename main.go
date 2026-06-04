@@ -28,6 +28,8 @@ const (
 type model struct {
 	activeTab tabView
 	isTyping  bool
+	width     int
+	height    int
 	regex     regexVaultModel
 	git       gitAnalyticsModel
 }
@@ -35,6 +37,8 @@ type model struct {
 type regexVaultModel struct {
 	inputs      [2]textinput.Model
 	focusIndex  int
+	width       int
+	height      int
 	compiled    *regexp.Regexp
 	compileErr  string
 	highlighted string
@@ -72,6 +76,8 @@ type gitScanErrorMsg struct {
 
 type gitAnalyticsModel struct {
 	pathInput    textinput.Model
+	width        int
+	height       int
 	scanning     bool
 	reposScanned int
 	lastRepo     string
@@ -107,9 +113,15 @@ func initialModel() model {
 		pathInput: gitPathInput,
 	}
 
+	initialWidth, initialHeight := 80, 24
+	rv.setSize(initialWidth-2, initialHeight-7)
+	gav.setSize(initialWidth-2, initialHeight-7)
+
 	return model{
 		activeTab: tabRegexVault,
 		isTyping:  true,
+		width:     initialWidth,
+		height:    initialHeight,
 		regex:     rv,
 		git:       gav,
 	}
@@ -120,6 +132,16 @@ func (m model) Init() tea.Cmd {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		bodyWidth, bodyHeight := m.bodyDimensions()
+		m.regex.setSize(bodyWidth, bodyHeight)
+		m.git.setSize(bodyWidth, bodyHeight)
+		return m, nil
+	}
+
 	if isGitScanMsg(msg) {
 		var cmd tea.Cmd
 		m.git, cmd = m.git.Update(msg)
@@ -173,7 +195,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	m.isTyping = false
 
-	GlobalKeys:
+GlobalKeys:
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -228,7 +250,8 @@ func (m model) View() string {
 		help = "\n\nGit Analytics Controls: Enter starts scan | Tab switches tabs"
 	}
 
-	return header + "\n\n" + body + help + "\n"
+	composed := header + "\n\n" + body + help + "\n"
+	return responsiveRender(composed, clampMin(m.width, 20), clampMin(m.height, 8))
 }
 
 func (r regexVaultModel) Update(msg tea.Msg) (regexVaultModel, tea.Cmd) {
@@ -284,6 +307,17 @@ func (r *regexVaultModel) recompute() {
 	r.highlighted = highlightMatches(compiled, testStr)
 }
 
+func (r *regexVaultModel) setSize(width, height int) {
+	r.width = clampMin(width, 20)
+	r.height = clampMin(height, 8)
+
+	patternPromptWidth := lipgloss.Width(r.inputs[0].Prompt)
+	testPromptWidth := lipgloss.Width(r.inputs[1].Prompt)
+	inputWidth := clampMin(r.width-maxInt(patternPromptWidth, testPromptWidth)-2, 10)
+	r.inputs[0].Width = inputWidth
+	r.inputs[1].Width = inputWidth
+}
+
 func (r regexVaultModel) View() string {
 	activeStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
 	inactiveStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
@@ -303,7 +337,7 @@ func (r regexVaultModel) View() string {
 		status = errorStyle.Render("Invalid regex: " + r.compileErr)
 	}
 
-	return strings.Join([]string{
+	content := strings.Join([]string{
 		patternTitle,
 		r.inputs[0].View(),
 		"",
@@ -315,6 +349,8 @@ func (r regexVaultModel) View() string {
 		"",
 		status,
 	}, "\n")
+
+	return responsiveRender(content, clampMin(r.width, 20), clampMin(r.height, 8))
 }
 
 func highlightMatches(re *regexp.Regexp, s string) string {
@@ -459,7 +495,44 @@ func (g gitAnalyticsModel) View() string {
 		lines = append(lines, "", metaStyle.Render("Enter an absolute path and press Enter to scan local repositories."))
 	}
 
-	return strings.Join(lines, "\n")
+	content := strings.Join(lines, "\n")
+	return responsiveRender(content, clampMin(g.width, 20), clampMin(g.height, 8))
+}
+
+func (g *gitAnalyticsModel) setSize(width, height int) {
+	g.width = clampMin(width, 20)
+	g.height = clampMin(height, 8)
+	inputWidth := clampMin(g.width-lipgloss.Width(g.pathInput.Prompt)-2, 10)
+	g.pathInput.Width = inputWidth
+}
+
+func (m model) bodyDimensions() (int, int) {
+	return clampMin(m.width-2, 20), clampMin(m.height-7, 8)
+}
+
+func clampMin(v, min int) int {
+	if v < min {
+		return min
+	}
+	return v
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func responsiveRender(text string, width, height int) string {
+	if width <= 0 || height <= 0 {
+		return ""
+	}
+
+	return lipgloss.NewStyle().
+		MaxWidth(width).
+		MaxHeight(height).
+		Render(text)
 }
 
 func isGitScanMsg(msg tea.Msg) bool {
