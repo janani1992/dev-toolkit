@@ -2,9 +2,15 @@ package main
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -23,6 +29,7 @@ type model struct {
 	activeTab tabView
 	isTyping  bool
 	regex     regexVaultModel
+	git       gitAnalyticsModel
 }
 
 type regexVaultModel struct {
@@ -31,6 +38,46 @@ type regexVaultModel struct {
 	compiled    *regexp.Regexp
 	compileErr  string
 	highlighted string
+}
+
+type gitRepoStat struct {
+	Path         string
+	TotalCommits int
+	TopDays      []dayCount
+}
+
+type dayCount struct {
+	Day   string
+	Count int
+}
+
+type gitScanProgressMsg struct {
+	RepoPath     string
+	ReposScanned int
+	RepoStat     gitRepoStat
+}
+
+type gitScanSuccessMsg struct {
+	RootPath     string
+	ReposScanned int
+	TotalCommits int
+	TopDays      []dayCount
+	RepoStats    []gitRepoStat
+	Duration     time.Duration
+}
+
+type gitScanErrorMsg struct {
+	Err string
+}
+
+type gitAnalyticsModel struct {
+	pathInput    textinput.Model
+	scanning     bool
+	reposScanned int
+	lastRepo     string
+	scanErr      string
+	result       *gitScanSuccessMsg
+	scanCh       <-chan tea.Msg
 }
 
 func initialModel() model {
@@ -51,10 +98,20 @@ func initialModel() model {
 	}
 	rv.recompute()
 
+	gitPathInput := textinput.New()
+	gitPathInput.Prompt = "Root Path: "
+	gitPathInput.Placeholder = "/Users/username/Projects"
+	gitPathInput.CharLimit = 1024
+
+	gav := gitAnalyticsModel{
+		pathInput: gitPathInput,
+	}
+
 	return model{
 		activeTab: tabRegexVault,
 		isTyping:  true,
 		regex:     rv,
+		git:       gav,
 	}
 }
 
@@ -63,6 +120,12 @@ func (m model) Init() tea.Cmd {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if isGitScanMsg(msg) {
+		var cmd tea.Cmd
+		m.git, cmd = m.git.Update(msg)
+		return m, cmd
+	}
+
 	if m.activeTab == tabRegexVault {
 		if keyMsg, ok := msg.(tea.KeyMsg); ok {
 			switch keyMsg.String() {
@@ -86,6 +149,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
+	if m.activeTab == tabGitAnalytics {
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			switch keyMsg.String() {
+			case "tab", "shift+tab":
+				goto GlobalKeys
+			}
+		}
+
+		var cmd tea.Cmd
+		m.git, cmd = m.git.Update(msg)
+		m.isTyping = true
+
+		if keyMsg, ok := msg.(tea.KeyMsg); ok {
+			switch keyMsg.String() {
+			case "q", "ctrl+c":
+				return m, nil
+			}
+		}
+
+		return m, cmd
+	}
+
 	m.isTyping = false
 
 	GlobalKeys:
@@ -94,12 +179,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "tab":
 			m.activeTab = (m.activeTab + 1) % tabCount
-			if m.activeTab == tabRegexVault {
+			if m.activeTab == tabRegexVault || m.activeTab == tabGitAnalytics {
 				m.isTyping = true
 			}
 		case "shift+tab":
 			m.activeTab = (m.activeTab - 1 + tabCount) % tabCount
-			if m.activeTab == tabRegexVault {
+			if m.activeTab == tabRegexVault || m.activeTab == tabGitAnalytics {
 				m.isTyping = true
 			}
 		case "ctrl+c", "q":
@@ -131,7 +216,7 @@ func (m model) View() string {
 	case tabRegexVault:
 		body = m.regex.View()
 	case tabGitAnalytics:
-		body = "Git Analytics is active."
+		body = m.git.View()
 	default:
 		body = "Unknown tab."
 	}
@@ -139,6 +224,8 @@ func (m model) View() string {
 	help := "\n\nTab: next tab | Shift+Tab: previous tab | q/ctrl+c: quit"
 	if m.activeTab == tabRegexVault {
 		help = "\n\nRegex Vault Controls: up/down or k/j switch input focus"
+	} else if m.activeTab == tabGitAnalytics {
+		help = "\n\nGit Analytics Controls: Enter starts scan | Tab switches tabs"
 	}
 
 	return header + "\n\n" + body + help + "\n"
@@ -263,6 +350,280 @@ func highlightMatches(re *regexp.Regexp, s string) string {
 	b.WriteString(s[last:])
 
 	return b.String()
+}
+
+func (g gitAnalyticsModel) Update(msg tea.Msg) (gitAnalyticsModel, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "enter":
+			if g.scanning {
+				return g, nil
+			}
+
+			rootPath := strings.TrimSpace(g.pathInput.Value())
+			if rootPath == "" {
+				g.scanErr = "Please enter an absolute directory path."
+				return g, nil
+			}
+			if !filepath.IsAbs(rootPath) {
+				g.scanErr = "Path must be absolute."
+				return g, nil
+			}
+
+			stat, err := os.Stat(rootPath)
+			if err != nil || !stat.IsDir() {
+				g.scanErr = "Path is not a readable directory."
+				return g, nil
+			}
+
+			g.scanning = true
+			g.reposScanned = 0
+			g.lastRepo = ""
+			g.scanErr = ""
+			g.result = nil
+
+			scanCh := make(chan tea.Msg, 32)
+			g.scanCh = scanCh
+			go runGitAnalyticsScan(rootPath, scanCh)
+
+			return g, waitForGitScanMsg(scanCh)
+		}
+
+		updated, cmd := g.pathInput.Update(msg)
+		g.pathInput = updated
+		return g, cmd
+
+	case gitScanProgressMsg:
+		g.reposScanned = msg.ReposScanned
+		g.lastRepo = msg.RepoPath
+		return g, waitForGitScanMsg(g.scanCh)
+
+	case gitScanSuccessMsg:
+		g.scanning = false
+		g.result = &msg
+		g.reposScanned = msg.ReposScanned
+		g.lastRepo = ""
+		g.scanErr = ""
+		g.scanCh = nil
+		return g, nil
+
+	case gitScanErrorMsg:
+		g.scanning = false
+		g.scanErr = msg.Err
+		g.scanCh = nil
+		return g, nil
+	}
+
+	return g, nil
+}
+
+func (g gitAnalyticsModel) View() string {
+	labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+	metaStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("241"))
+	errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+
+	lines := []string{
+		labelStyle.Render("Git Analytics"),
+		g.pathInput.View(),
+	}
+
+	if g.scanning {
+		status := fmt.Sprintf("Scanning: %d repos found...", g.reposScanned)
+		if g.lastRepo != "" {
+			status += " Last: " + g.lastRepo
+		}
+		lines = append(lines, "", metaStyle.Render(status))
+	} else if g.result != nil {
+		lines = append(lines,
+			"",
+			metaStyle.Render(fmt.Sprintf("Scan complete in %s", g.result.Duration.Round(10*time.Millisecond))),
+			fmt.Sprintf("Root: %s", g.result.RootPath),
+			fmt.Sprintf("Repositories: %d", g.result.ReposScanned),
+			fmt.Sprintf("Total commits: %d", g.result.TotalCommits),
+			formatTopDaysLine(g.result.TopDays),
+			"",
+			"Repositories:",
+		)
+
+		for _, repo := range g.result.RepoStats {
+			lines = append(lines, fmt.Sprintf("- %s | commits: %d | %s", repo.Path, repo.TotalCommits, formatTopDaysInline(repo.TopDays)))
+		}
+	}
+
+	if g.scanErr != "" {
+		lines = append(lines, "", errorStyle.Render(g.scanErr))
+	}
+
+	if !g.scanning && g.result == nil && g.scanErr == "" {
+		lines = append(lines, "", metaStyle.Render("Enter an absolute path and press Enter to scan local repositories."))
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+func isGitScanMsg(msg tea.Msg) bool {
+	switch msg.(type) {
+	case gitScanProgressMsg, gitScanSuccessMsg, gitScanErrorMsg:
+		return true
+	default:
+		return false
+	}
+}
+
+func waitForGitScanMsg(scanCh <-chan tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		if scanCh == nil {
+			return nil
+		}
+		msg, ok := <-scanCh
+		if !ok {
+			return nil
+		}
+		return msg
+	}
+}
+
+func runGitAnalyticsScan(rootPath string, out chan<- tea.Msg) {
+	defer close(out)
+
+	start := time.Now()
+	repoStats := make([]gitRepoStat, 0)
+	aggregatedDayCounts := make(map[string]int)
+	totalCommits := 0
+	reposScanned := 0
+
+	walkErr := filepath.WalkDir(rootPath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() {
+			return nil
+		}
+
+		if d.Name() == ".git" {
+			repoPath := filepath.Dir(path)
+			repoStat, dayCounts, statErr := analyzeGitRepository(repoPath)
+			if statErr == nil {
+				repoStats = append(repoStats, repoStat)
+				totalCommits += repoStat.TotalCommits
+				for day, count := range dayCounts {
+					aggregatedDayCounts[day] += count
+				}
+			}
+
+			reposScanned++
+			out <- gitScanProgressMsg{
+				RepoPath:     repoPath,
+				ReposScanned: reposScanned,
+				RepoStat:     repoStat,
+			}
+
+			return filepath.SkipDir
+		}
+
+		return nil
+	})
+
+	if walkErr != nil {
+		out <- gitScanErrorMsg{Err: walkErr.Error()}
+		return
+	}
+
+	out <- gitScanSuccessMsg{
+		RootPath:     rootPath,
+		ReposScanned: reposScanned,
+		TotalCommits: totalCommits,
+		TopDays:      topDaysFromMap(aggregatedDayCounts),
+		RepoStats:    repoStats,
+		Duration:     time.Since(start),
+	}
+}
+
+func analyzeGitRepository(repoPath string) (gitRepoStat, map[string]int, error) {
+	countCmd := exec.Command("git", "-C", repoPath, "rev-list", "--all", "--count")
+	countOut, err := countCmd.Output()
+	if err != nil {
+		return gitRepoStat{}, nil, err
+	}
+
+	countStr := strings.TrimSpace(string(countOut))
+	if countStr == "" {
+		countStr = "0"
+	}
+
+	totalCommits, err := strconv.Atoi(countStr)
+	if err != nil {
+		return gitRepoStat{}, nil, err
+	}
+
+	logCmd := exec.Command("git", "-C", repoPath, "log", "--all", "--pretty=format:%ad", "--date=format:%A")
+	logOut, err := logCmd.Output()
+	if err != nil {
+		return gitRepoStat{}, nil, err
+	}
+
+	dayCounts := make(map[string]int)
+	for _, line := range strings.Split(strings.TrimSpace(string(logOut)), "\n") {
+		day := strings.TrimSpace(line)
+		if day == "" {
+			continue
+		}
+		dayCounts[day]++
+	}
+
+	repoStat := gitRepoStat{
+		Path:         repoPath,
+		TotalCommits: totalCommits,
+		TopDays:      topDaysFromMap(dayCounts),
+	}
+
+	return repoStat, dayCounts, nil
+}
+
+func topDaysFromMap(dayCounts map[string]int) []dayCount {
+	orderedDays := []string{"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"}
+	result := make([]dayCount, 0, len(dayCounts))
+
+	for day, count := range dayCounts {
+		result = append(result, dayCount{Day: day, Count: count})
+	}
+
+	orderIndex := make(map[string]int, len(orderedDays))
+	for i, day := range orderedDays {
+		orderIndex[day] = i
+	}
+
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Count == result[j].Count {
+			return orderIndex[result[i].Day] < orderIndex[result[j].Day]
+		}
+		return result[i].Count > result[j].Count
+	})
+
+	if len(result) > 3 {
+		return result[:3]
+	}
+
+	return result
+}
+
+func formatTopDaysLine(days []dayCount) string {
+	if len(days) == 0 {
+		return "Top active days: n/a"
+	}
+	return "Top active days: " + formatTopDaysInline(days)
+}
+
+func formatTopDaysInline(days []dayCount) string {
+	if len(days) == 0 {
+		return "n/a"
+	}
+	parts := make([]string, 0, len(days))
+	for _, day := range days {
+		parts = append(parts, fmt.Sprintf("%s(%d)", day.Day, day.Count))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func main() {
